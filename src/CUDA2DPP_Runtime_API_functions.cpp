@@ -30,6 +30,7 @@ const std::map<llvm::StringRef, dppCounter> CUDA_RUNTIME_FUNCTION_MAP = [] {
   m["cudaMalloc"]                                              = {"aclrtMalloc",                                            CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
   m["cudaFree"]                                              = {"aclrtFree",                                               CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
   m["cudaMemcpy"]                                              = {"aclrtMemcpy",                                              CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
+  m["free"] = {"aclrtFreeHost", CONV_MEMORY, API_RUNTIME, SEC::MEMORY};
   // TODO: Add cuda runtime API functions here  
   return m;
 }();
