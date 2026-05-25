@@ -72,7 +72,7 @@ Example (adjust paths and Clang major version):
   -o /tmp/vector_add.cpp
 ```
 
-Write to a file with **`-o`**, a directory tree with **`-o-dir`**, or inspect only with **`-examine`** (combines `-no-output` and `-print-stats`).
+Where `--clang-resource-directory` specifies `lib/clang/23`, which is in the **install directory of llvm-project**, that is, the `-DCMAKE_INSTALL_PREFIX` of llvm-project. Write to a file with **`-o`**, a directory tree with **`-o-dir`**, or inspect only with **`-examine`** (combines `-no-output` and `-print-stats`).
 
 ### Useful ascify options
 
