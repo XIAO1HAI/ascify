@@ -27,7 +27,7 @@ const std::map<llvm::StringRef, dppCounter> CUDA_DEVICE_TYPE_NAME_MAP = [] {
   std::map<llvm::StringRef, dppCounter> m;
   // Bfloat16 type (verified against CANN 9.0.0: Ascend uses bfloat16_t, not acl_bfloat16)
   m["nv_bfloat16"]    = {"bfloat16_t",       CONV_DEVICE_TYPE, API_RUNTIME, 0};
-  m["nv_bfloat16_2"]  = {"bfloat16x2_t",     CONV_DEVICE_TYPE, API_RUNTIME, 0};
+  m["nv_bfloat16_2"]  = {"bfloat16_t",     CONV_DEVICE_TYPE, API_RUNTIME, 0};
   return m;
 }();
 
@@ -36,9 +36,9 @@ const std::map<llvm::StringRef, dppCounter> CUDA_DEVICE_FUNCTION_MAP = [] {
   std::map<llvm::StringRef, dppCounter> m;
   // Math constants (verified: ASCRT_* macros not available in CANN 9.0.0; use standard C limits)
   m["CUDART_INF_F"]      = {"ASCRT_INF_F",     CONV_NUMERIC_LITERAL, API_RUNTIME, 0};
-  m["CUDART_INF"]        = {"",                CONV_NUMERIC_LITERAL, API_RUNTIME, UNSUPPORTED};
+  m["CUDART_INF"]        = {"ASCRT_INF_F",                CONV_NUMERIC_LITERAL, API_RUNTIME, UNSUPPORTED};// double type need todo
   m["CUDART_NAN_F"]      = {"ASCRT_NAN_F",    CONV_NUMERIC_LITERAL, API_RUNTIME, 0};
-  m["CUDART_NAN"]        = {"",                CONV_NUMERIC_LITERAL, API_RUNTIME, UNSUPPORTED};
+  m["CUDART_NAN"]        = {"ASCRT_INF_F",                CONV_NUMERIC_LITERAL, API_RUNTIME, UNSUPPORTED};// double type need todo
   m["CUDART_MAX_NORMAL_F"] = {"__FLT_MAX__", CONV_NUMERIC_LITERAL, API_RUNTIME, 0};
   m["CUDART_MIN_NORMAL_F"] = {"__FLT_MIN__", CONV_NUMERIC_LITERAL, API_RUNTIME, 0};
   m["CUDART_NEG_ZERO_F"] = {"(-0.0f)",    CONV_NUMERIC_LITERAL, API_RUNTIME, 0};
@@ -59,11 +59,11 @@ const std::map<llvm::StringRef, dppCounter> CUDA_DEVICE_FUNCTION_MAP = [] {
   m["__threadfence_block"] = {"asc_threadfence_block", CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__threadfence"]       = {"asc_threadfence",       CONV_DEVICE_FUNC, API_RUNTIME, 0};
   // Fast math intrinsics (keep same on SIMT)
-  m["__expf"]            = {"__expf",            CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__logf"]            = {"__logf",            CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__log2f"]           = {"__log2f",           CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__log10f"]          = {"__log10f",          CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["__fdividef"]        = {"__fdividef",        CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__expf"]            = {"__builtin_expf",            CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__logf"]            = {"__builtin_logf",            CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__log2f"]           = {"__builtin_log2f",           CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__log10f"]          = {"__builtin_log10f",          CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__fdividef"]        = {"__builtin_fdividef",        CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__fmul_rn"]         = {"__fmul_rn",         CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__fmaf_rn"]          = {"__fmaf_rn",         CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__fadd_rn"]          = {"__fadd_rn",         CONV_DEVICE_FUNC, API_RUNTIME, 0};
@@ -80,16 +80,16 @@ const std::map<llvm::StringRef, dppCounter> CUDA_DEVICE_FUNCTION_MAP = [] {
   m["__longlong_as_double"] = {"__longlong_as_double", CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["__double_as_longlong"] = {"__double_as_longlong", CONV_DEVICE_FUNC, API_RUNTIME, 0};
   // Trap -> __trap (CCE directly supports __trap)
-  m["__trap"]             = {"__trap",          CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["__trap"]             = {"__builtin_trap",          CONV_DEVICE_FUNC, API_RUNTIME, 0};
   // Math function type conversion: double-precision -> single-precision (A5 vector core does not support double)
-  m["exp"]                = {"expf",              CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["log"]                = {"logf",              CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["sqrt"]               = {"sqrtf",             CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["exp"]                = {"__builtin_expf",              CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["log"]                = {"__builtin_logf",              CONV_DEVICE_FUNC, API_RUNTIME, 0};
+  m["sqrt"]               = {"__builtin_sqrtf",             CONV_DEVICE_FUNC, API_RUNTIME, 0};
   // Type conversion: double -> float (A5 vector core does not support double)
   m["double"]             = {"float",             CONV_DEVICE_TYPE, API_RUNTIME, 0};
   // std::max/min -> Ascend SIMT equivalents
-  m["std::max"]           = {"llmax",             CONV_DEVICE_FUNC, API_RUNTIME, 0};
-  m["std::min"]           = {"llmin",             CONV_DEVICE_FUNC, API_RUNTIME, 0};
+//   m["std::max"]           = {"llmax",             CONV_DEVICE_FUNC, API_RUNTIME, 0};
+//   m["std::min"]           = {"llmin",             CONV_DEVICE_FUNC, API_RUNTIME, 0};
   // blockIdx/threadIdx dim3 fields (keep same on SIMT)
   m["blockIdx"]           = {"blockIdx",          CONV_DEVICE_FUNC, API_RUNTIME, 0};
   m["threadIdx"]          = {"threadIdx",         CONV_DEVICE_FUNC, API_RUNTIME, 0};

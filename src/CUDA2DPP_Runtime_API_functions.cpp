@@ -63,6 +63,6 @@ const std::map<llvm::StringRef, dppCounter> CUDA_RUNTIME_FUNCTION_MAP = [] {
   // Occupancy API: no Ascend equivalent (verified CANN 9.0.0). Manual rewrite needed:
   // Replace with: int sm_count; aclrtGetDeviceCount(&sm_count);
   //               *num_blocks = max(1, min(max_blocks, sm_count * tpm / block_size * waves));
-  m["cudaOccupancyMaxActiveBlocksPerMultiprocessor"]            = {"/* [ASCIFY: no Ascend Occupancy API - see GetNumBlocks rewrite] */ cudaOccupancyMaxActiveBlocksPerMultiprocessor", CONV_OCCUPANCY, API_RUNTIME, SEC::OCCUPANCY | UNSUPPORTED};
+  m["cudaOccupancyMaxActiveBlocksPerMultiprocessor"]            = {"", CONV_OCCUPANCY, API_RUNTIME, SEC::OCCUPANCY | UNSUPPORTED};
   return m;
 }();
