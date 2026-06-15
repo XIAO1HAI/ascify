@@ -1,0 +1,227 @@
+/*
+ * bench_allreduce_db.cce  (0612 iteration-2, kCols-templated, +auto dispatch)
+ * ----------------------------------------------------------------------------
+ * Head-to-head of five BlockReduce tails on the SAME grid-stride load loop,
+ * validating correctness vs a CPU reference (CUB-aligned semantics) and
+ * measuring the per-row barrier / second-level-fold cost across block sizes:
+ *
+ *   V0  Reduce(acc,op)         + end reuse-guard barrier        [pre-0612]
+ *   V1  AllReduce(acc,op)      + end reuse-guard barrier        [0612 ship, single-buf]
+ *   V2  AllReduceSerial(.,row) + NO end barrier                 [double-buf, serial fold]
+ *   V3  AllReduceW(.,row)      + NO end barrier                 [double-buf, warp fold]
+ *   V4  AllReduce(.,row)       + NO end barrier                 [double-buf, AUTO fold]
+ *
+ * V4 compile-time-picks serial(<=4 warps) vs warp(>=5 warps); it should equal
+ * max(V2,V3) at every block.  Metric: read BW = rows*kCols*4 / time.
+ *
+ * Build:  bash build_allreduce_db.sh   Output: results_allreduce_db.json
+ */
+
+#include "acl/acl.h"
+#include <acl_cub/aclcub.hpp>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+
+static inline float gen_input(uint32_t i) {
+  uint32_t z = i + 0x9E3779B9u;
+  z = (z ^ (z >> 16)) * 0x85EBCA6Bu;
+  z = (z ^ (z >> 13)) * 0xC2B2AE35u;
+  z =  z ^ (z >> 16);
+  return (static_cast<float>(z >> 8) * (1.0f / 16777216.0f)) * 2.0f - 1.0f;
+}
+
+namespace oneflow { namespace cuda { namespace softmax {
+template <typename T>
+struct SumOp { __aicore__ inline T operator()(const T& a, const T& b) const { return a + b; } };
+template <typename T>
+struct MaxOp { __aicore__ inline T operator()(const T& a, const T& b) const { return a > b ? a : b; } };
+} } }
+
+static constexpr int kWarmup = 5;
+static constexpr int kIters  = 50;
+static constexpr int kRowsMax = 131072;            // sized for kCols=256 (128 MB)
+
+// VARIANT: 0=Reduce+EB 1=AllReduce(SB)+EB 2=serialDB 3=warpDB 4=autoDB
+template <typename T, int BLOCK, int KCOLS, int VARIANT, template <typename> class Op>
+__global__ void kern(const T* __restrict__ in, T* __restrict__ out, int rows) {
+  typedef aclcub::BlockReduce<T, BLOCK> BR;
+  __ubuf__ typename BR::TempStorage tmp;
+  const int tid = threadIdx.x;
+  Op<T> op;
+  // `it` is the block-local iteration index (0,1,2,...) — the correct parity
+  // source for the double-buffered AllReduce (NOT the global row, which advances
+  // by gridDim.x and would have constant parity for an even grid).
+  int it = 0;
+  for (int row = blockIdx.x; row < rows; row += gridDim.x, ++it) {
+    const T* prow = in + static_cast<int64_t>(row) * KCOLS;
+    constexpr int IPT = KCOLS / BLOCK;
+    T acc = prow[tid];
+#pragma unroll
+    for (int i = 1; i < IPT; ++i) acc = op(acc, prow[tid + i * BLOCK]);
+    T agg;
+    if (VARIANT == 0) {
+      agg = BR(tmp).Reduce(acc, op);
+      if (BR::kWarps > 1) asc_syncthreads();
+    } else if (VARIANT == 1) {
+      agg = BR(tmp).AllReduce(acc, op);
+      if (BR::kWarps > 1) asc_syncthreads();
+    } else if (VARIANT == 2) {
+      agg = BR(tmp).AllReduceSerial(acc, op, it);
+    } else if (VARIANT == 3) {
+      agg = BR(tmp).AllReduceW(acc, op, it);
+    } else {
+      agg = BR(tmp).AllReduce(acc, op, it);     // auto, double-buffered
+    }
+    if (tid == 0) out[row] = agg;
+  }
+}
+
+template <typename T, int BLOCK, int KCOLS, int VARIANT, template <typename> class Op>
+double bench(const T* d_in, T* d_out, aclrtStream stream, int rows, int grid) {
+  for (int i = 0; i < kWarmup; ++i)
+    kern<T, BLOCK, KCOLS, VARIANT, Op><<<grid, BLOCK, 0, stream>>>(d_in, d_out, rows);
+  aclrtSynchronizeStream(stream);
+  aclrtEvent start = nullptr, stop = nullptr;
+  aclrtCreateEvent(&start);
+  aclrtCreateEvent(&stop);
+  aclrtRecordEvent(start, stream);
+  for (int i = 0; i < kIters; ++i)
+    kern<T, BLOCK, KCOLS, VARIANT, Op><<<grid, BLOCK, 0, stream>>>(d_in, d_out, rows);
+  aclrtRecordEvent(stop, stream);
+  aclrtSynchronizeStream(stream);
+  float ms = 0.0f;
+  aclrtEventElapsedTime(&ms, start, stop);
+  aclrtDestroyEvent(start);
+  aclrtDestroyEvent(stop);
+  return static_cast<double>(ms) / kIters;
+}
+
+// op_tag: 0=Sum 1=Max
+template <typename T, int BLOCK, int KCOLS, int VARIANT, template <typename> class Op>
+int verify(const T* d_in, T* d_out, const T* h_in, aclrtStream stream,
+           int rows, int grid, int op_tag, const char* name) {
+  kern<T, BLOCK, KCOLS, VARIANT, Op><<<grid, BLOCK, 0, stream>>>(d_in, d_out, rows);
+  aclrtSynchronizeStream(stream);
+  T* h_out = static_cast<T*>(malloc(static_cast<size_t>(rows) * sizeof(T)));
+  aclrtMemcpy(h_out, static_cast<size_t>(rows) * sizeof(T),
+              d_out, static_cast<size_t>(rows) * sizeof(T), ACL_MEMCPY_DEVICE_TO_HOST);
+  double max_abs = 0.0, max_rel = 0.0; int bad = 0;
+  for (int r = 0; r < rows; ++r) {
+    const T* prow = h_in + static_cast<int64_t>(r) * KCOLS;
+    double ref;
+    if (op_tag == 0) { double s = 0.0; for (int j = 0; j < KCOLS; ++j) s += prow[j]; ref = s; }
+    else             { double m = prow[0]; for (int j = 1; j < KCOLS; ++j) if (prow[j] > m) m = prow[j]; ref = m; }
+    double got = static_cast<double>(h_out[r]);
+    double abs = fabs(got - ref);
+    double rel = abs / (fabs(ref) + 1e-12);
+    if (abs > max_abs) max_abs = abs;
+    if (rel > max_rel) max_rel = rel;
+    double tol = (op_tag == 0) ? (2e-3 * (fabs(ref) + 1.0)) : 1e-5;
+    if (abs > tol) ++bad;
+  }
+  free(h_out);
+  printf("[verify] %-18s b=%-4d c=%-4d op=%s  max_abs=%.2e max_rel=%.2e  %s\n",
+         name, BLOCK, KCOLS, op_tag == 0 ? "Sum" : "Max", max_abs, max_rel,
+         bad == 0 ? "PASS" : "FAIL");
+  return bad == 0 ? 0 : 1;
+}
+
+template <typename T, int BLOCK, int KCOLS, int VARIANT, template <typename> class Op>
+double sweep(const T* d_in, T* d_out, aclrtStream stream, int rows, FILE* f, const char* vname) {
+  const int grids[] = {112, 224, 448, 896};
+  const int ng = static_cast<int>(sizeof(grids) / sizeof(grids[0]));
+  double best = 0.0; int bg = 0;
+  for (int g = 0; g < ng; ++g) {
+    double ms = bench<T, BLOCK, KCOLS, VARIANT, Op>(d_in, d_out, stream, rows, grids[g]);
+    double gb = (static_cast<double>(rows) * KCOLS * sizeof(T)) / (ms * 1.0e6);
+    if (gb > best) { best = gb; bg = grids[g]; }
+  }
+  printf("  [%-16s] b=%-4d c=%-4d rows=%-7d  best=%.2f GB/s @ grid=%d\n",
+         vname, BLOCK, KCOLS, rows, best, bg);
+  fprintf(f, "    {\"variant\":\"%s\",\"block\":%d,\"kcols\":%d,\"rows\":%d,\"best_gbps\":%.2f,\"best_grid\":%d}",
+          vname, BLOCK, KCOLS, rows, best, bg);
+  return best;
+}
+
+// Full V0..V4 sweep for one (block,kcols), both cold(128MB) and L2(64MB).
+template <typename T, int BLOCK, int KCOLS>
+void run_cell(const T* d_in, T* d_out, aclrtStream stream, FILE* f, int* first) {
+  const int rows_cold = (128 << 20) / (KCOLS * (int)sizeof(T));
+  const int rows_l2   = ( 64 << 20) / (KCOLS * (int)sizeof(T));
+  for (int phase = 0; phase < 2; ++phase) {
+    int rows = (phase == 0) ? rows_cold : rows_l2;
+    printf("--- block=%d kCols=%d rows=%d (%s) ---\n", BLOCK, KCOLS, rows, phase ? "L2" : "cold");
+    if (!*first) fprintf(f, ",\n"); *first = 0;
+    double v0 = sweep<T,BLOCK,KCOLS,0,oneflow::cuda::softmax::SumOp>(d_in,d_out,stream,rows,f,"V0_Reduce_EB");   fprintf(f, ",\n");
+    double v1 = sweep<T,BLOCK,KCOLS,1,oneflow::cuda::softmax::SumOp>(d_in,d_out,stream,rows,f,"V1_AllReduce_EB"); fprintf(f, ",\n");
+    double v2 = sweep<T,BLOCK,KCOLS,2,oneflow::cuda::softmax::SumOp>(d_in,d_out,stream,rows,f,"V2_serialDB");     fprintf(f, ",\n");
+    double v3 = sweep<T,BLOCK,KCOLS,3,oneflow::cuda::softmax::SumOp>(d_in,d_out,stream,rows,f,"V3_warpDB");       fprintf(f, ",\n");
+    double v4 = sweep<T,BLOCK,KCOLS,4,oneflow::cuda::softmax::SumOp>(d_in,d_out,stream,rows,f,"V4_autoDB");
+    double d40 = (v0>0)?100.0*(v4-v0)/v0:0.0;
+    double d41 = (v1>0)?100.0*(v4-v1)/v1:0.0;
+    printf("  >>> b=%d c=%d rows=%d : V0=%.1f V1=%.1f V2=%.1f V3=%.1f | V4(auto)=%.1f (vsV0 %+.1f%%, vsV1 %+.1f%%)\n",
+           BLOCK, KCOLS, rows, v0, v1, v2, v3, v4, d40, d41);
+  }
+}
+
+int main() {
+  aclInit(nullptr);
+  aclrtContext ctx; aclrtSetDevice(0); aclrtCreateContext(&ctx, 0);
+  aclrtStream stream = nullptr; aclrtCreateStream(&stream);
+
+  const size_t n_in = static_cast<size_t>(kRowsMax) * 256;   // largest footprint = kCols256 path
+  const size_t in_bytes = n_in * sizeof(float);
+  const size_t out_bytes = static_cast<size_t>(kRowsMax) * sizeof(float);
+  float* h_in = static_cast<float*>(malloc(in_bytes));
+  for (size_t i = 0; i < n_in; ++i) h_in[i] = gen_input(static_cast<uint32_t>(i));
+
+  float *d_in = nullptr, *d_out = nullptr;
+  aclrtMalloc((void**)&d_in,  in_bytes,  ACL_MEM_MALLOC_HUGE_FIRST);
+  aclrtMalloc((void**)&d_out, out_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+  aclrtMemcpy(d_in, in_bytes, h_in, in_bytes, ACL_MEMCPY_HOST_TO_DEVICE);
+
+  // ---------------- Correctness (rows=4096) ----------------
+  printf("==== CORRECTNESS ====\n");
+  int fails = 0; const int rc = 4096, gc = 112;
+  fails += verify<float,32, 256,0,oneflow::cuda::softmax::SumOp>(d_in,d_out,h_in,stream,rc,gc,0,"V0_Reduce");
+  fails += verify<float,64, 256,4,oneflow::cuda::softmax::SumOp>(d_in,d_out,h_in,stream,rc,gc,0,"V4_auto");
+  fails += verify<float,128,256,4,oneflow::cuda::softmax::SumOp>(d_in,d_out,h_in,stream,rc,gc,0,"V4_auto");
+  fails += verify<float,256,256,4,oneflow::cuda::softmax::SumOp>(d_in,d_out,h_in,stream,rc,gc,0,"V4_auto");
+  fails += verify<float,256,1024,4,oneflow::cuda::softmax::SumOp>(d_in,d_out,h_in,stream,rc,gc,0,"V4_auto");
+  fails += verify<float,512,1024,4,oneflow::cuda::softmax::SumOp>(d_in,d_out,h_in,stream,rc,gc,0,"V4_auto");
+  fails += verify<float,1024,1024,4,oneflow::cuda::softmax::SumOp>(d_in,d_out,h_in,stream,rc,gc,0,"V4_auto");
+  fails += verify<float,128,256,4,oneflow::cuda::softmax::MaxOp>(d_in,d_out,h_in,stream,rc,gc,1,"V4_auto");
+  fails += verify<float,256,256,4,oneflow::cuda::softmax::MaxOp>(d_in,d_out,h_in,stream,rc,gc,1,"V4_auto");
+  fails += verify<float,1024,1024,4,oneflow::cuda::softmax::MaxOp>(d_in,d_out,h_in,stream,rc,gc,1,"V4_auto");
+  // Grid-parity independence of the fixed per-iteration counter: the double
+  // buffer must alternate correctly at BOTH even and odd grids (the old row&1
+  // scheme degenerated to single-buffer on even grids -> latent reuse race).
+  fails += verify<float,256,256,4,oneflow::cuda::softmax::SumOp>(d_in,d_out,h_in,stream,rc,113,0,"V4_oddgrid");
+  fails += verify<float,256,256,4,oneflow::cuda::softmax::SumOp>(d_in,d_out,h_in,stream,rc,224,0,"V4_evengrid");
+  fails += verify<float,512,1024,4,oneflow::cuda::softmax::SumOp>(d_in,d_out,h_in,stream,rc,113,0,"V4_oddgrid");
+  fails += verify<float,512,1024,4,oneflow::cuda::softmax::MaxOp>(d_in,d_out,h_in,stream,rc,113,1,"V4_oddgrid");
+  printf("==== CORRECTNESS %s (%d fail) ====\n", fails == 0 ? "ALL PASS" : "FAILURES", fails);
+
+  // ---------------- Performance ----------------
+  printf("\n==== PERF (kCols=256: blocks 32-256) ====\n");
+  FILE* f = fopen("results_allreduce_db.json", "w");
+  fprintf(f, "{\n  \"platform\":\"ascend_aclcub_allreduce_db\",\n  \"peak_gbps\":1400.0,\n  \"iters\":%d,\n  \"correctness_fails\":%d,\n  \"sweep\":[\n", kIters, fails);
+  int first = 1;
+  run_cell<float,32, 256>(d_in,d_out,stream,f,&first);
+  run_cell<float,64, 256>(d_in,d_out,stream,f,&first);
+  run_cell<float,128,256>(d_in,d_out,stream,f,&first);
+  run_cell<float,256,256>(d_in,d_out,stream,f,&first);
+  printf("\n==== PERF (kCols=1024: large softmax blocks 256-1024) ====\n");
+  run_cell<float,256, 1024>(d_in,d_out,stream,f,&first);
+  run_cell<float,512, 1024>(d_in,d_out,stream,f,&first);
+  run_cell<float,1024,1024>(d_in,d_out,stream,f,&first);
+  fprintf(f, "\n  ]\n}\n");
+  fclose(f);
+
+  aclrtFree(d_in); aclrtFree(d_out); free(h_in);
+  aclrtDestroyStream(stream); aclrtDestroyContext(ctx); aclrtResetDevice(0); aclFinalize();
+  return fails == 0 ? 0 : 2;
+}
